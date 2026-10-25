@@ -142,7 +142,7 @@ with st.sidebar:
     if not st.session_state.user:
         pages = ["Home", "Admin Login", "Student / Parent Login"]
     elif current_role == "admin":
-        pages = ["Admin Overview", "Students", "Batches & Classes", "Online Classes", "Attendance", "Fees & Payments", "Assignments", "Academic Reports", "Admin Settings"]
+        pages = ["Admin Overview", "Students", "Batches & Classes", "Online Classes", "Attendance", "Fees & Payments", "Assignments", "Academic Reports", "Admin Settings", "Database Cleanup"]
     elif current_role == "tutor":
         pages = ["Tutor Dashboard", "Batches & Classes", "Online Classes", "Attendance", "Assignments", "Academic Reports"]
     elif current_role == "student":
@@ -638,7 +638,84 @@ elif page == "Academic Reports":
 
 elif page == "Admin Settings":
     if require_roles("admin"):
-        page_header("Admin settings","Control account roles and academy access.")
+        page_header("Admin settings","Control account roles, academy access and automatic student-to-batch matching.")
+        st.subheader("Auto-assign students")
+        st.caption("Rules are saved in Supabase. Automatic matching uses grade, board, subject preferences, batch capacity and schedule-text conflict checks. Because existing schedules are free text, schedule conflict detection is conservative; use consistent schedule text and review suggestions before enabling auto-enrollment.")
+        settings_rows = safe_call(lambda: result_data(sb.table("auto_assignment_settings").select("*").eq("id", 1).limit(1).execute()), [])
+        current_settings = settings_rows[0] if settings_rows else {}
+        with st.form("auto_assignment_settings_form"):
+            auto_enabled = st.toggle("Enable automatic batch suggestions", value=bool(current_settings.get("enabled", True)))
+            auto_enroll = st.toggle("Automatically enroll when exactly one eligible batch matches", value=bool(current_settings.get("auto_enroll_single_match", False)))
+            require_approval = st.toggle("Require admin approval before enrollment", value=bool(current_settings.get("require_approval", True)))
+            match_board = st.checkbox("Match school board", value=bool(current_settings.get("match_board", True)))
+            match_grade = st.checkbox("Match class/grade", value=bool(current_settings.get("match_grade", True)))
+            match_subject = st.checkbox("Match subject", value=bool(current_settings.get("match_subject", True)))
+            check_capacity = st.checkbox("Respect batch capacity", value=bool(current_settings.get("check_capacity", True)))
+            check_schedule = st.checkbox("Check for schedule conflicts", value=bool(current_settings.get("check_schedule_conflicts", True)))
+            default_capacity = st.number_input("Default batch capacity", min_value=1, max_value=500, value=int(current_settings.get("default_capacity", 20)))
+            save_auto_settings = st.form_submit_button("Save auto-assignment settings", type="primary")
+        if save_auto_settings:
+            settings_payload = {"id":1,"enabled":auto_enabled,"auto_enroll_single_match":auto_enroll,"require_approval":require_approval,"match_board":match_board,"match_grade":match_grade,"match_subject":match_subject,"check_capacity":check_capacity,"check_schedule_conflicts":check_schedule,"default_capacity":int(default_capacity),"updated_by":st.session_state.user.id,"updated_at":datetime.now().isoformat()}
+            save_result = safe_call(lambda: sb.table("auto_assignment_settings").upsert(settings_payload, on_conflict="id").execute())
+            if save_result is not None:
+                st.success("Auto-assignment settings saved.")
+                st.rerun()
+        st.markdown("---")
+        st.subheader("Match students to eligible batches")
+        st.caption("Preview matching first. The app only enrolls when the configured rules allow it; manual enrollment remains available under Batches & Classes.")
+        students_auto = safe_call(lambda: list_rows("students"), [])
+        batches_auto = safe_call(lambda: list_rows("batches"), [])
+        enrollments_auto = safe_call(lambda: list_rows("batch_enrollments"), [])
+        if students_auto and batches_auto and current_settings.get("enabled", True):
+            student_labels_auto = {f"{x.get('student_code') or x.get('id','')[:8]} · {x.get('student_name')} · Class {x.get('grade')} · {x.get('board')}":x for x in students_auto}
+            with st.form("auto_assign_preview_form"):
+                student_label_auto = st.selectbox("Student to match", list(student_labels_auto))
+                preview_submit = st.form_submit_button("Find matching batches")
+            if preview_submit:
+                st.session_state["auto_assign_target_id"] = student_labels_auto[student_label_auto]["id"]
+            target_id = st.session_state.get("auto_assign_target_id")
+            target_student = next((x for x in students_auto if x.get("id") == target_id), None)
+            if target_student:
+                enrolled_batch_ids = {str(x.get("batch_id")) for x in enrollments_auto if str(x.get("student_id")) == str(target_id) and x.get("status", "active") == "active"}
+                eligible, rejected = [], []
+                for batch in batches_auto:
+                    if batch.get("status", "active") != "active" or str(batch.get("id")) in enrolled_batch_ids:
+                        continue
+                    reasons=[]
+                    if current_settings.get("match_grade", True) and batch.get("grade") != target_student.get("grade"): reasons.append("grade mismatch")
+                    if current_settings.get("match_board", True) and batch.get("board") != target_student.get("board"): reasons.append("board mismatch")
+                    # Subject match is only meaningful when a student's preferred_subjects field exists.
+                    prefs = target_student.get("preferred_subjects") or []
+                    if isinstance(prefs, str): prefs=[x.strip().lower() for x in prefs.split(",") if x.strip()]
+                    if current_settings.get("match_subject", True) and prefs and str(batch.get("subject","")).lower() not in [str(x).lower() for x in prefs]: reasons.append("subject mismatch")
+                    active_count = sum(1 for e in enrollments_auto if str(e.get("batch_id")) == str(batch.get("id")) and e.get("status", "active") == "active")
+                    cap = int(batch.get("capacity") or current_settings.get("default_capacity",20))
+                    if current_settings.get("check_capacity", True) and active_count >= cap: reasons.append("batch full")
+                    if current_settings.get("check_schedule_conflicts", True):
+                        target_schedule = str(batch.get("schedule_text") or "").strip().lower()
+                        existing_schedules = [str(b.get("schedule_text") or "").strip().lower() for b in batches_auto if str(b.get("id")) in enrolled_batch_ids]
+                        if target_schedule and any(target_schedule == x for x in existing_schedules if x): reasons.append("same schedule text as an existing enrollment")
+                    if reasons: rejected.append({"Batch":batch.get("name"),"Subject":batch.get("subject"),"Schedule":batch.get("schedule_text"),"Reason":", ".join(reasons)})
+                    else: eligible.append(batch)
+                if eligible:
+                    st.success(f"{len(eligible)} eligible batch(es) found for {target_student.get('student_name')}.")
+                    st.dataframe(pd.DataFrame([{"Batch":b.get("name"),"Class":b.get("grade"),"Board":b.get("board"),"Subject":b.get("subject"),"Schedule":b.get("schedule_text") or "Not set","Capacity":b.get("capacity") or current_settings.get("default_capacity",20)} for b in eligible]),use_container_width=True,hide_index=True)
+                    if current_settings.get("auto_enroll_single_match",False) and not current_settings.get("require_approval",True) and len(eligible)==1:
+                        if st.button("Confirm automatic enrollment",type="primary"):
+                            er=safe_call(lambda: sb.table("batch_enrollments").upsert({"student_id":target_id,"batch_id":eligible[0]["id"],"status":"active"},on_conflict="student_id,batch_id").execute())
+                            if er is not None: st.success(f"Enrolled in {eligible[0].get('name')}."); st.rerun()
+                    else:
+                        batch_choice=st.selectbox("Choose a batch to enroll",[f"{b.get('name')} · {b.get('subject')} · {b.get('schedule_text') or 'Schedule not set'}" for b in eligible],key="auto_assign_choice")
+                        chosen=eligible[[f"{b.get('name')} · {b.get('subject')} · {b.get('schedule_text') or 'Schedule not set'}" for b in eligible].index(batch_choice)]
+                        if st.button("Enroll selected student",type="primary"):
+                            er=safe_call(lambda: sb.table("batch_enrollments").upsert({"student_id":target_id,"batch_id":chosen["id"],"status":"active"},on_conflict="student_id,batch_id").execute())
+                            if er is not None: st.success(f"Enrolled in {chosen.get('name')}."); st.rerun()
+                else: st.warning("No eligible batches matched. Review the matching rules, capacity and schedule.")
+                if rejected:
+                    with st.expander("Batches excluded by matching rules"):
+                        st.dataframe(pd.DataFrame(rejected),use_container_width=True,hide_index=True)
+        elif not students_auto or not batches_auto:
+            st.info("Create at least one student and one batch to use auto-assignment.")
         st.warning("Role changes are managed here. Passwords are never displayed to administrators; use account recovery/reset flows. Creating Auth accounts on behalf of students requires a secure server-side invite function.")
         st.markdown("""
         **Bootstrap the first administrator**
@@ -692,6 +769,94 @@ elif page == "Admin Settings":
                 res = safe_call(lambda: update_row("profiles",pmap[key]["id"],vals))
                 if res is not None: st.success("Profile updated. User may need to sign in again.")
         st.caption("Database row-level security policies are the actual security boundary. Review schema.sql before launch.")
+
+
+elif page == "Database Cleanup":
+    if require_roles("admin"):
+        page_header("Database cleanup & data maintenance", "Admin-only tools to export backups, reset selected student records, delete selected students, or clear operational data.")
+        st.error("DESTRUCTIVE ACTIONS: take and verify backups first. These actions cannot be undone from this screen.")
+        st.info("This tool never deletes Supabase Auth users, admin profiles, database tables, schema, or project settings. Full cleanup removes academy operational records only.")
+
+        # Export current data before allowing destructive actions. RLS remains enforced by Supabase.
+        st.subheader("1. Export backups before cleanup")
+        export_tables = [
+            ("students", "students_backup.csv"),
+            ("batches", "batches_backup.csv"),
+            ("attendance", "attendance_backup.csv"),
+            ("fee_records", "fee_records_backup.csv"),
+            ("payments", "payments_backup.csv"),
+            ("assignments", "assignments_backup.csv"),
+            ("assessment_scores", "assessment_scores_backup.csv"),
+            ("batch_enrollments", "batch_enrollments_backup.csv"),
+            ("class_meetings", "class_meetings_backup.csv"),
+            ("assignment_submissions", "assignment_submissions_backup.csv"),
+        ]
+        export_cols = st.columns(3)
+        for idx, (table_name, filename) in enumerate(export_tables):
+            with export_cols[idx % 3]:
+                if st.button(f"Prepare {table_name} backup", key=f"cleanup_export_{table_name}", use_container_width=True):
+                    rows = safe_call(lambda t=table_name: result_data(sb.table(t).select("*").limit(5000).execute()), None)
+                    if rows is not None:
+                        df = table_df(rows)
+                        if df.empty:
+                            st.warning(f"No rows found in {table_name}, or the table is not available yet.")
+                        else:
+                            st.download_button(f"Download {table_name} CSV", df.to_csv(index=False).encode("utf-8"), filename, "text/csv", key=f"cleanup_download_{table_name}")
+
+        st.divider()
+        st.subheader("2. Reset or delete selected students")
+        students_cleanup = safe_call(lambda: list_rows("students", limit=5000), [])
+        if not students_cleanup:
+            st.info("No student records are available to manage.")
+        else:
+            student_labels = {
+                f"{x.get('student_code') or 'NO-ID'} · {x.get('student_name')} · Class {x.get('grade')} · {x.get('board')} · {x.get('status')}": x
+                for x in students_cleanup
+            }
+            selected_labels = st.multiselect("Select student(s)", list(student_labels), key="cleanup_students_selected")
+            cleanup_action = st.radio(
+                "Choose action",
+                ["Clear academic/fee activity (keep student record)", "Delete student record and linked activity"],
+                key="cleanup_student_action",
+            )
+            st.caption("Clear keeps the student name, student ID and account mapping, but removes attendance, fee records/payments, scores, submissions and batch enrollments. Delete removes the student record too. Shared batches, meetings and assignments are not deleted by a selected-student action.")
+            confirmation_text = "CLEAR SELECTED STUDENTS" if cleanup_action.startswith("Clear") else "DELETE SELECTED STUDENTS"
+            typed_confirmation = st.text_input(f"Type exactly: {confirmation_text}", key="cleanup_selected_confirmation")
+            if st.button("Run selected-student action", type="primary", disabled=not selected_labels, key="cleanup_selected_run"):
+                if typed_confirmation.strip() != confirmation_text:
+                    st.error("Confirmation text does not match. No data was changed.")
+                else:
+                    ids = [str(student_labels[label]["id"]) for label in selected_labels]
+                    rpc_name = "admin_clear_student_activity" if cleanup_action.startswith("Clear") else "admin_delete_students"
+                    response = safe_call(lambda: sb.rpc(rpc_name, {"target_student_ids": ids}).execute(), None)
+                    if response is not None:
+                        st.success(f"Request completed: {cleanup_action.lower()} for {len(ids)} selected student(s). Review the cleanup audit log in Supabase.")
+                        st.session_state.pop("cleanup_students_selected", None)
+                        st.rerun()
+
+        st.divider()
+        st.subheader("3. Full operational database reset")
+        st.warning("This removes all students, batches, batch enrollments, class meetings, attendance, assignments, assignment submissions, assessment scores, fee records and payments. It preserves profiles/Auth accounts and the database schema. Do not use this for routine maintenance.")
+        full_confirm = st.text_input('Type exactly: RESET ALL ACADEMY DATA', key="cleanup_full_confirmation")
+        full_ack = st.checkbox("I have exported and checked backups, and understand this deletes all academy operational records.", key="cleanup_full_ack")
+        if st.button("Reset all academy data", type="primary", disabled=not full_ack, key="cleanup_full_run"):
+            if full_confirm.strip() != "RESET ALL ACADEMY DATA":
+                st.error("Confirmation text does not match. No data was changed.")
+            else:
+                response = safe_call(lambda: sb.rpc("admin_reset_academy_data", {}).execute(), None)
+                if response is not None:
+                    st.success("Full operational reset completed. Admin/tutor/student/parent login profiles and database structure were preserved.")
+                    st.rerun()
+
+        st.divider()
+        st.subheader("4. Audit history")
+        st.caption("Destructive actions are recorded by database functions in `admin_cleanup_audit`. If the table is not yet available, apply the cleanup migration before using these controls.")
+        audit_rows = safe_call(lambda: result_data(sb.table("admin_cleanup_audit").select("created_at,actor_id,action,scope,details").order("created_at", desc=True).limit(100).execute()), None)
+        if audit_rows is not None:
+            if audit_rows:
+                st.dataframe(table_df(audit_rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No cleanup actions recorded yet.")
 
 st.divider()
 st.caption("© 2026 JrAdemy Online Tuition · Classes 1–10 · CBSE · ICSE · Karnataka State Board")
