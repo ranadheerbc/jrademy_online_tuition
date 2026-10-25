@@ -57,14 +57,49 @@ if "user" not in st.session_state:
     st.session_state.user = None
 if "profile" not in st.session_state:
     st.session_state.profile = None
+# Streamlit reruns the script on most interactions. Keep the Supabase Auth
+# tokens in session_state and restore them onto each newly-created client so
+# PostgREST requests carry the signed-in user's JWT and RLS can identify auth.uid().
+if "supabase_access_token" not in st.session_state:
+    st.session_state.supabase_access_token = None
+if "supabase_refresh_token" not in st.session_state:
+    st.session_state.supabase_refresh_token = None
 
 def get_profile(user_id):
     rows = result_data(sb.table("profiles").select("*").eq("id", user_id).limit(1).execute())
     return rows[0] if rows else None
 
+def restore_supabase_session():
+    """Restore the authenticated Supabase session on this script rerun."""
+    if not sb or not st.session_state.supabase_access_token or not st.session_state.supabase_refresh_token:
+        return
+    try:
+        auth_response = sb.auth.set_session(
+            st.session_state.supabase_access_token,
+            st.session_state.supabase_refresh_token,
+        )
+        session = getattr(auth_response, "session", None)
+        user = getattr(auth_response, "user", None)
+        if session:
+            st.session_state.supabase_access_token = getattr(session, "access_token", None)
+            st.session_state.supabase_refresh_token = getattr(session, "refresh_token", None)
+        if user:
+            st.session_state.user = user
+            # Refresh the profile using the restored JWT, not the anonymous client.
+            st.session_state.profile = get_profile(user.id)
+    except Exception:
+        # A revoked/expired session should not leave the UI claiming the user is signed in.
+        st.session_state.user = None
+        st.session_state.profile = None
+        st.session_state.supabase_access_token = None
+        st.session_state.supabase_refresh_token = None
+
 def refresh_profile():
     if sb and st.session_state.user:
         st.session_state.profile = safe_call(lambda: get_profile(st.session_state.user.id))
+
+# Must run after get_profile is defined and before any database operation/UI.
+restore_supabase_session()
 
 if sb is None:
     st.markdown('<div class="hero"><h1>JrAdemy Online Tuition</h1><p>Learn Better. Grow Brighter.</p></div>', unsafe_allow_html=True)
@@ -89,6 +124,8 @@ with st.sidebar:
             safe_call(lambda: sb.auth.sign_out())
             st.session_state.user = None
             st.session_state.profile = None
+            st.session_state.supabase_access_token = None
+            st.session_state.supabase_refresh_token = None
             st.rerun()
     page = st.radio("Navigation", [
         "Home", "Sign in / Register", "My Dashboard", "Students",
@@ -168,6 +205,10 @@ elif page == "Sign in / Register":
                 else:
                     auth_result = sb.auth.sign_in_with_password({"email": email.strip(), "password": password})
                     st.session_state.user = auth_result.user
+                    session = getattr(auth_result, "session", None)
+                    if session:
+                        st.session_state.supabase_access_token = getattr(session, "access_token", None)
+                        st.session_state.supabase_refresh_token = getattr(session, "refresh_token", None)
                     st.session_state.profile = get_profile(auth_result.user.id)
                     if not st.session_state.profile:
                         st.warning("Authentication succeeded, but no profile exists. Ask an administrator to create/approve your profile.")
