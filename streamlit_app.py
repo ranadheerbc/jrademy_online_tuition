@@ -181,6 +181,119 @@ def list_rows(table, limit=500):
 def update_row(table, row_id, values):
     return sb.table(table).update(values).eq("id", row_id).execute()
 
+def render_student_portal():
+    """Render only the student/guardian records allowed by Supabase RLS."""
+    user_id = str(st.session_state.user.id)
+    profile = st.session_state.profile or {}
+    st.markdown('<div class="portal-hero"><h1>Your learning space</h1><p>Classes, homework, results, attendance and fee status — in one place.</p></div>', unsafe_allow_html=True)
+    linked = safe_call(lambda: result_data(sb.table("students").select("id,student_code,student_name,grade,board,status,linked_profile_id,guardian_profile_id").or_(f"linked_profile_id.eq.{user_id},guardian_profile_id.eq.{user_id}").execute()), [])
+    if not linked:
+        st.warning("Your login is active, but an administrator has not linked it to a student record yet. Ask the academy administrator to open Admin Settings → Student account mapping.")
+        st.caption("Once mapped, this page will show your personal classes, assignments, academic results, attendance and fee balance.")
+        return
+
+    # Parents can be linked to multiple children; students are normally linked to one record.
+    chosen_label = {f"{x.get('student_code') or 'Student'} · {x.get('student_name')} · Class {x.get('grade')} · {x.get('board')}": x for x in linked}
+    if len(chosen_label) > 1:
+        selected_label = st.selectbox("Choose student", list(chosen_label), key="portal_student_select")
+        student = chosen_label[selected_label]
+    else:
+        student = linked[0]
+    student_id = student["id"]
+    st.markdown(f"### {student.get('student_name','Student')}  ")
+    st.caption(f"Student ID: **{student.get('student_code') or 'Pending ID'}** · Class: **{student.get('grade') or '—'}** · Board: **{student.get('board') or '—'}** · Status: **{student.get('status') or '—'}**")
+
+    meetings, assignments, attendance, fees, scores, enrollments = [], [], [], [], [], []
+    meetings = safe_call(lambda: result_data(sb.table("class_meetings").select("id,title,batch_id,meeting_date,start_time,end_time,platform,meeting_url,notes,status").gte("meeting_date", str(date.today())).order("meeting_date").execute()), [])
+    # RLS restricts meetings to enrolled batches, so no cross-student links are exposed.
+    assignments = safe_call(lambda: result_data(sb.table("assignments").select("id,title,grade,board,subject,due_date,instructions,status,batch_id").eq("status","published").eq("grade",student["grade"]).eq("board",student["board"]).order("due_date").execute()), [])
+    attendance = safe_call(lambda: result_data(sb.table("attendance").select("attendance_date,status,batch_id").eq("student_id",student_id).order("attendance_date",desc=True).execute()), [])
+    fees = safe_call(lambda: result_data(sb.table("fee_records").select("id,amount_due,due_date,fee_period,status,notes").eq("student_id",student_id).order("due_date",desc=True).execute()), [])
+    scores = safe_call(lambda: result_data(sb.table("assessment_scores").select("subject,score,max_score,feedback,assessed_at,assignment_id").eq("student_id",student_id).order("assessed_at",desc=True).execute()), [])
+    enrollments = safe_call(lambda: result_data(sb.table("batch_enrollments").select("batch_id,status").eq("student_id",student_id).eq("status","active").execute()), [])
+    batch_ids = {str(x.get("batch_id")) for x in enrollments}
+    meetings = [m for m in meetings if str(m.get("batch_id")) in batch_ids]
+    assignments = [a for a in assignments if not a.get("batch_id") or str(a.get("batch_id")) in batch_ids]
+
+    fee_ids = [str(f["id"]) for f in fees]
+    payments = []
+    if fee_ids:
+        payments = safe_call(lambda: result_data(sb.table("payments").select("fee_record_id,amount,paid_on,method,reference").in_("fee_record_id", fee_ids).order("paid_on",desc=True).execute()), [])
+    paid_by_fee = {}
+    for payment in payments:
+        key = str(payment.get("fee_record_id"))
+        paid_by_fee[key] = paid_by_fee.get(key, 0.0) + float(payment.get("amount") or 0)
+    total_fee = sum(float(f.get("amount_due") or 0) for f in fees)
+    total_paid = sum(paid_by_fee.values())
+    total_due = max(0.0, total_fee - total_paid)
+    present = sum(1 for x in attendance if x.get("status") in ("present", "late"))
+    attendance_rate = (present / len(attendance) * 100) if attendance else 0
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Upcoming classes", len(meetings))
+    c2.metric("Assignments", len(assignments))
+    c3.metric("Attendance", f"{attendance_rate:.0f}%" if attendance else "—")
+    c4.metric("Fee balance", f"₹{total_due:,.2f}")
+
+    tab_classes, tab_assignments, tab_results, tab_attendance, tab_fees = st.tabs(["🎥 Online classes", "📝 Assignments", "📊 Results", "📅 Attendance", "💳 Fees & payments"])
+    with tab_classes:
+        st.subheader("Your online class schedule")
+        if meetings:
+            for m in meetings:
+                st.markdown(f'<div class="feature-card"><h3>🎥 {m.get("title") or "Online class"}</h3><p><b>{m.get("meeting_date")}</b> · {m.get("start_time","")}–{m.get("end_time","")} · {m.get("platform") or "Online"}</p><p>{m.get("notes") or "No class notes provided yet."}</p></div>', unsafe_allow_html=True)
+                st.link_button("Join online class ↗", m.get("meeting_url") or "", disabled=not bool(m.get("meeting_url")), key=f"join_{m.get('id')}")
+        else:
+            st.info("No upcoming online classes are scheduled for your enrolled batches yet.")
+    with tab_assignments:
+        st.subheader("Homework and assignments")
+        submissions = safe_call(lambda: result_data(sb.table("assignment_submissions").select("id,assignment_id,answer_text,submitted_at,status,tutor_feedback").eq("student_id",student_id).execute()), [])
+        sub_by_assignment = {str(x.get("assignment_id")):x for x in submissions}
+        if not assignments:
+            st.info("No published assignments match your class and board right now.")
+        for assignment in assignments:
+            sub = sub_by_assignment.get(str(assignment["id"]), {})
+            with st.expander(f"{assignment.get('subject')} · {assignment.get('title')} · Due {assignment.get('due_date')}", expanded=False):
+                st.write(assignment.get("instructions") or "No additional instructions.")
+                if sub:
+                    st.success(f"Submission status: {sub.get('status','submitted')} · {str(sub.get('submitted_at',''))[:10]}")
+                    if sub.get("tutor_feedback"): st.info(f"Tutor feedback: {sub['tutor_feedback']}")
+                else:
+                    st.caption("Not submitted yet")
+                with st.form(f"submit_assignment_{assignment['id']}"):
+                    answer = st.text_area("Your answer / submission notes", value=sub.get("answer_text") or "", key=f"answer_{assignment['id']}")
+                    submit = st.form_submit_button("Submit assignment" if not sub else "Update submission")
+                if submit:
+                    payload = {"assignment_id":assignment["id"],"student_id":student_id,"answer_text":answer.strip(),"status":"submitted","submitted_at":datetime.now().astimezone().isoformat()}
+                    result = safe_call(lambda: sb.table("assignment_submissions").upsert(payload,on_conflict="assignment_id,student_id").execute())
+                    if result is not None:
+                        st.success("Assignment submitted.")
+                        st.rerun()
+    with tab_results:
+        st.subheader("Academic results")
+        if scores:
+            score_df = pd.DataFrame([{ "Subject":x.get("subject"), "Score":x.get("score"), "Out of":x.get("max_score"), "Percentage":round(float(x.get("score") or 0)/float(x.get("max_score") or 1)*100,1), "Date":str(x.get("assessed_at") or "")[:10], "Feedback":x.get("feedback") or "—"} for x in scores])
+            st.dataframe(score_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No assessment results have been published yet.")
+    with tab_attendance:
+        st.subheader("Attendance history")
+        if attendance:
+            att_df = pd.DataFrame([{ "Date":x.get("attendance_date"), "Status":str(x.get("status","")).title()} for x in attendance])
+            st.dataframe(att_df, use_container_width=True, hide_index=True)
+        else: st.info("No attendance entries are available yet.")
+    with tab_fees:
+        st.subheader("Fee status")
+        a,b,c = st.columns(3); a.metric("Total fees",f"₹{total_fee:,.2f}"); b.metric("Paid",f"₹{total_paid:,.2f}"); c.metric("Balance due",f"₹{total_due:,.2f}")
+        if fees:
+            fee_rows = []
+            for f in fees:
+                amount = float(f.get("amount_due") or 0); paid = paid_by_fee.get(str(f["id"]),0.0)
+                fee_rows.append({"Fee period":f.get("fee_period") or "—", "Fee amount":amount, "Paid":paid, "Balance":max(0,amount-paid), "Due date":f.get("due_date"), "Status":"Paid" if amount-paid <= 0 else ("Partially paid" if paid > 0 else f.get("status","Due").replace("_"," ").title())})
+            st.dataframe(pd.DataFrame(fee_rows), use_container_width=True, hide_index=True)
+        else: st.info("No fee records are available yet.")
+        if payments:
+            st.caption("Recorded payments")
+            st.dataframe(pd.DataFrame([{ "Date":p.get("paid_on"),"Amount":f"₹{float(p.get('amount') or 0):,.2f}","Method":p.get("method"),"Reference":p.get("reference") or "—"} for p in payments]), use_container_width=True, hide_index=True)
+
 if page == "Home":
     st.markdown('<div class="hero"><h1>Big goals begin with small wins.</h1><p>Learn Better. Grow Brighter. One connected place for tuition, live classes, assignments and academic growth.</p></div>', unsafe_allow_html=True)
     st.write("")
@@ -295,13 +408,7 @@ elif page in ["Admin Overview", "Tutor Dashboard", "Student Portal", "Parent Por
                         st.session_state["quick_nav"] = target
                         st.info(f"Use the {target} page in the sidebar to continue.")
         elif role() in ["student", "parent"]:
-            st.markdown('<div class="portal-hero"><h1>Your learning space</h1><p>Classes, homework and progress — in one place.</p></div>', unsafe_allow_html=True)
-            st.info("Your account is signed in. To safely show personal schedules, meeting links, attendance, fees and assignments, the database must first link this login to the correct student record. That relationship is not configured yet, so private student records are intentionally not displayed.")
-            st.subheader("What will appear here")
-            c1,c2,c3 = st.columns(3)
-            c1.markdown('<div class="feature-card"><h3>🎥 Online classes</h3><p>Meeting link, date, time, teacher and class notes.</p></div>', unsafe_allow_html=True)
-            c2.markdown('<div class="feature-card"><h3>📝 Assignments</h3><p>Homework instructions, due dates and feedback.</p></div>', unsafe_allow_html=True)
-            c3.markdown('<div class="feature-card"><h3>📈 Progress</h3><p>Attendance and academic progress for your linked student.</p></div>', unsafe_allow_html=True)
+            render_student_portal()
         else:
             st.warning("Your account role is pending administrator approval.")
 
@@ -331,9 +438,12 @@ elif page == "Students":
                     res = safe_call(lambda: add_row("students",payload))
                     if res is not None: st.success("Student saved.")
         rows = safe_call(lambda: list_rows("students"), [])
-        st.dataframe(table_df(rows), use_container_width=True, hide_index=True)
         if rows:
-            st.download_button("Export students CSV", table_df(rows).to_csv(index=False), "jrademy_students.csv", "text/csv")
+            friendly = pd.DataFrame([{ "Student ID":x.get("student_code") or "Pending ID", "Student name":x.get("student_name"), "Class":x.get("grade"), "Board":x.get("board"), "Guardian":x.get("guardian_name"), "Guardian email":x.get("guardian_email"), "Phone":x.get("guardian_phone"), "Status":x.get("status"), "Account linked":bool(x.get("linked_profile_id"))} for x in rows])
+            st.dataframe(friendly, use_container_width=True, hide_index=True)
+            st.download_button("Export students CSV", friendly.to_csv(index=False), "jrademy_students.csv", "text/csv")
+        else:
+            st.info("No student records yet.")
 
 elif page == "Batches & Classes":
     if require_roles("admin","tutor"):
@@ -357,7 +467,24 @@ elif page == "Batches & Classes":
                                                            "start_date":str(start_date),"status":"active"}))
                 if res is not None: st.success("Batch created.")
         rows = safe_call(lambda: list_rows("batches"), [])
-        st.dataframe(table_df(rows), use_container_width=True, hide_index=True)
+        if rows:
+            st.dataframe(pd.DataFrame([{ "Batch":x.get("name"), "Class":x.get("grade"), "Board":x.get("board"), "Subject":x.get("subject"), "Schedule":x.get("schedule_text"), "Start date":x.get("start_date"), "Status":x.get("status")} for x in rows]), use_container_width=True, hide_index=True)
+            students_for_enrol = safe_call(lambda: list_rows("students"), [])
+            if students_for_enrol:
+                st.subheader("Enroll student into a batch")
+                student_map = {f"{x.get('student_code') or 'Pending ID'} · {x.get('student_name')} · Class {x.get('grade')}":x for x in students_for_enrol}
+                batch_map = {f"{x.get('name')} · Class {x.get('grade')} · {x.get('subject')}":x for x in rows}
+                with st.form("batch_enrollment_form"):
+                    student_label = st.selectbox("Student", list(student_map))
+                    batch_label = st.selectbox("Batch", list(batch_map))
+                    enroll_status = st.selectbox("Enrollment status", ["active","paused","completed"])
+                    enroll_submit = st.form_submit_button("Save enrollment")
+                if enroll_submit:
+                    student_obj, batch_obj = student_map[student_label], batch_map[batch_label]
+                    enroll_res = safe_call(lambda: sb.table("batch_enrollments").upsert({"student_id":student_obj["id"],"batch_id":batch_obj["id"],"status":enroll_status},on_conflict="student_id,batch_id").execute())
+                    if enroll_res is not None: st.success("Student batch enrollment saved.")
+        else:
+            st.info("Create a batch before enrolling students.")
 
 elif page == "Online Classes":
     if require_roles("admin", "tutor"):
@@ -369,7 +496,7 @@ elif page == "Online Classes":
         except Exception:
             existing_meetings = []
         if batches:
-            bmap = {f"{b.get('name')} · Class {b.get('grade')} · {b.get('subject')} · {b.get('id')}": b for b in batches}
+            bmap = {f"{b.get('name')} · Class {b.get('grade')} · {b.get('subject')}": b for b in batches}
             with st.form("meeting_form", clear_on_submit=True):
                 meeting_title = st.text_input("Meeting title *", placeholder="Class 7 Mathematics — Algebra")
                 batch_key = st.selectbox("Batch *", list(bmap))
@@ -416,7 +543,7 @@ elif page == "Attendance":
         if not students or not batches:
             st.info("Add at least one student and one batch first.")
         else:
-            student_map = {f"{x.get('student_name')} · Class {x.get('grade')} · {x.get('id')}":x for x in students}
+            student_map = {f"{x.get('student_code') or 'Pending ID'} · {x.get('student_name')} · Class {x.get('grade')}":x for x in students}
             batch_map = {f"{x.get('name')} · {x.get('id')}":x for x in batches}
             with st.form("attendance_form"):
                 selected_student = st.selectbox("Student", list(student_map))
@@ -438,7 +565,7 @@ elif page == "Fees & Payments":
         page_header("Fees & payments","Track fee obligations and manually recorded payments. This does not process online payments.")
         students = safe_call(lambda: list_rows("students"), [])
         if students:
-            smap = {f"{s['student_name']} · Class {s['grade']} · {s['id']}":s for s in students}
+            smap = {f"{s.get('student_code') or 'Pending ID'} · {s['student_name']} · Class {s['grade']}":s for s in students}
             with st.form("fee_form"):
                 student_key = st.selectbox("Student", list(smap))
                 amount_due = st.number_input("Fee amount (INR)", min_value=0.0, step=100.0)
@@ -454,7 +581,7 @@ elif page == "Fees & Payments":
         st.subheader("Record a payment")
         fees = safe_call(lambda: list_rows("fee_records"), [])
         if fees:
-            fmap = {f"{f.get('fee_period') or 'Fee'} · ₹{f.get('amount_due')} · {f.get('id')}":f for f in fees}
+            fmap = {f"{f.get('fee_period') or 'Fee'} · ₹{f.get('amount_due')} · Due {f.get('due_date')}":f for f in fees}
             with st.form("payment_form"):
                 fee_key = st.selectbox("Fee record", list(fmap))
                 amount = st.number_input("Amount received (INR)", min_value=1.0, step=100.0)
@@ -520,11 +647,40 @@ elif page == "Admin Settings":
         3. In SQL Editor, insert or update your `profiles` row with `role = 'admin'`.
         4. Sign out and back in to refresh the profile.
         """)
-        st.subheader("Profiles")
+        st.subheader("Student account mapping")
+        st.caption("Create the student record first, let the student/parent register or be invited securely, then link the existing profile here. Passwords are never visible in the admin portal.")
+        students_for_link = safe_call(lambda: list_rows("students"), [])
         profiles = safe_call(lambda: list_rows("profiles"), [])
-        st.dataframe(table_df(profiles), use_container_width=True, hide_index=True)
+        if students_for_link and profiles:
+            student_map = {f"{x.get('student_code') or 'Pending ID'} · {x.get('student_name')} · Class {x.get('grade')}":x for x in students_for_link}
+            student_profiles = [x for x in profiles if x.get("role") == "student"]
+            parent_profiles = [x for x in profiles if x.get("role") == "parent"]
+            with st.form("student_account_mapping_form"):
+                selected_student_label = st.selectbox("Student record", list(student_map))
+                student_profile_map = {f"{x.get('full_name') or 'Unnamed'} · {x.get('email') or 'No email'}":x for x in student_profiles}
+                parent_profile_map = {"No parent login linked":None, **{f"{x.get('full_name') or 'Unnamed'} · {x.get('email') or 'No email'}":x for x in parent_profiles}}
+                selected_student_profile = st.selectbox("Student login profile", ["No student login linked"] + list(student_profile_map))
+                selected_parent_profile = st.selectbox("Parent / guardian login (optional)", list(parent_profile_map))
+                mapping_submit = st.form_submit_button("Save student account mapping", type="primary")
+            if mapping_submit:
+                target_student = student_map[selected_student_label]
+                student_profile = student_profile_map.get(selected_student_profile)
+                parent_profile = parent_profile_map.get(selected_parent_profile)
+                update_values = {"linked_profile_id": student_profile.get("id") if student_profile else None,
+                                 "guardian_profile_id": parent_profile.get("id") if parent_profile else None}
+                mapping_result = safe_call(lambda: sb.table("students").update(update_values).eq("id", target_student["id"]).execute())
+                if mapping_result is not None:
+                    st.success("Student and parent mapping saved. Ask the user to sign out and sign in again.")
+                    st.rerun()
+        elif not students_for_link:
+            st.info("Add a student record first, then map an account to it.")
+        elif not profiles:
+            st.info("No registered profiles found yet. Have the student/parent register, then refresh this page.")
+        st.subheader("Profiles")
         if profiles:
-            pmap = {f"{p.get('full_name') or p.get('email') or p['id']} · {p['id']}":p for p in profiles}
+            st.dataframe(pd.DataFrame([{ "Name":x.get("full_name") or "—", "Email":x.get("email") or "—", "Role":x.get("role"), "Board":x.get("board") or "—", "Class":x.get("grade") or "—", "Created":str(x.get("created_at") or "")[:10]} for x in profiles]), use_container_width=True, hide_index=True)
+        if profiles:
+            pmap = {f"{p.get('full_name') or 'Unnamed'} · {p.get('email') or 'No email'}":p for p in profiles}
             with st.form("role_form"):
                 key = st.selectbox("Profile",list(pmap))
                 new_role = st.selectbox("New role",ROLES)
