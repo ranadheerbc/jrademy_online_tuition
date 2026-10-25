@@ -1,5 +1,5 @@
 import os
-from datetime import date, datetime
+from datetime import date, datetime, time
 import pandas as pd
 import streamlit as st
 from supabase import create_client, Client
@@ -14,7 +14,17 @@ html, body, [class*="css"] {font-family:'DM Sans',sans-serif}
 .hero {padding:2rem;border-radius:22px;background:linear-gradient(120deg,#172b61,#3457b8 70%,#7860cf);color:white}
 .hero h1 {font-family:Manrope,sans-serif;font-size:2.35rem;font-weight:800;margin:.2rem 0}
 .hero p {color:#e4eaff;font-size:1.05rem}
-div[data-testid="stMetric"] {background:white;border:1px solid #e3e9f7;padding:14px;border-radius:15px}
+div[data-testid="stMetric"] {background:white;border:1px solid #e3e9f7;padding:14px;border-radius:15px;transition:transform .22s ease,box-shadow .22s ease}
+div[data-testid="stMetric"]:hover {transform:translateY(-5px) rotateX(1deg);box-shadow:0 14px 28px rgba(30,55,120,.12)}
+.feature-card {background:linear-gradient(145deg,#ffffff,#f3f6ff);border:1px solid #e0e8ff;border-radius:18px;padding:1.1rem;min-height:155px;box-shadow:0 5px 12px rgba(30,55,120,.04);transition:transform .22s ease,box-shadow .22s ease,border-color .22s ease;margin-bottom:.8rem}
+.feature-card:hover {transform:translateY(-6px) perspective(800px) rotateX(1.2deg);box-shadow:0 18px 32px rgba(30,55,120,.15);border-color:#8ca6f5}
+.feature-card h3 {margin:.1rem 0 .55rem;color:#1b326c;font-size:1.08rem}
+.feature-card p {margin:0;color:#56658d;font-size:.94rem}
+.portal-hero {padding:1.5rem 1.7rem;border-radius:20px;background:linear-gradient(120deg,#172b61,#3457b8 65%,#7860cf);color:white;box-shadow:0 16px 34px rgba(38,61,140,.18)}
+.portal-hero h1 {color:white;font-family:Manrope,sans-serif;font-size:2rem;margin:.1rem 0 .5rem}
+.portal-hero p {color:#e4eaff;margin:0}
+button[kind="secondary"] {transition:transform .18s ease,box-shadow .18s ease}
+button[kind="secondary"]:hover {transform:translateY(-2px);box-shadow:0 8px 18px rgba(37,68,150,.14)}
 </style>
 """, unsafe_allow_html=True)
 
@@ -115,7 +125,9 @@ if sb is None:
 
 with st.sidebar:
     st.markdown("## 🎓 JrAdemy")
+    st.caption("Learn Better. Grow Brighter.")
     st.caption("Classes 1–10 · CBSE · ICSE · Karnataka")
+    current_role = (st.session_state.profile or {}).get("role", "") if st.session_state.user else ""
     if st.session_state.user:
         profile = st.session_state.profile or {}
         st.success(f"Signed in: {profile.get('full_name') or st.session_state.user.email}")
@@ -127,11 +139,21 @@ with st.sidebar:
             st.session_state.supabase_access_token = None
             st.session_state.supabase_refresh_token = None
             st.rerun()
-    page = st.radio("Navigation", [
-        "Home", "Sign in / Register", "My Dashboard", "Students",
-        "Batches & Classes", "Attendance", "Fees & Payments",
-        "Assignments", "Academic Reports", "Admin Settings"
-    ])
+    if not st.session_state.user:
+        pages = ["Home", "Admin Login", "Student / Parent Login"]
+    elif current_role == "admin":
+        pages = ["Admin Overview", "Students", "Batches & Classes", "Online Classes", "Attendance", "Fees & Payments", "Assignments", "Academic Reports", "Admin Settings"]
+    elif current_role == "tutor":
+        pages = ["Tutor Dashboard", "Batches & Classes", "Online Classes", "Attendance", "Assignments", "Academic Reports"]
+    elif current_role == "student":
+        pages = ["Student Portal"]
+    elif current_role == "parent":
+        pages = ["Parent Portal"]
+    else:
+        pages = ["Account Pending"]
+    preferred_page = st.session_state.get("selected_portal")
+    page_index = pages.index(preferred_page) if preferred_page in pages else 0
+    page = st.radio("Navigation", pages, index=page_index, label_visibility="visible")
 
 def require_login():
     if not st.session_state.user:
@@ -160,29 +182,45 @@ def update_row(table, row_id, values):
     return sb.table(table).update(values).eq("id", row_id).execute()
 
 if page == "Home":
-    st.markdown('<div class="hero"><h1>Big goals begin with small wins.</h1><p>One connected place for tuition admissions, batches, attendance, fee tracking and academic growth.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>Big goals begin with small wins.</h1><p>Learn Better. Grow Brighter. One connected place for tuition, live classes, assignments and academic growth.</p></div>', unsafe_allow_html=True)
     st.write("")
     c1,c2,c3,c4 = st.columns(4)
-    for col, label, value in [(c1,"Grades","1–10"),(c2,"Boards","3"),(c3,"Learning","Structured"),(c4,"Records","Cloud-backed")]:
+    for col, label, value in [(c1,"Grades","1–10"),(c2,"Boards","3"),(c3,"Learning","Structured"),(c4,"Experience","Interactive")]:
         col.metric(label, value)
     st.subheader("One platform for the whole tuition journey")
-    cols = st.columns(3)
     features = [
-        ("🎓","Student management","Admissions, guardian details, board, grade and enrolment status."),
-        ("🗓️","Classes & attendance","Batch schedules, attendance registers and class notes."),
-        ("💳","Fee tracking","Fee plans, invoices, payment records and outstanding balances."),
-        ("📝","Assignments","Create assignments, set due dates and record scores."),
-        ("📊","Academic reports","Performance by subject, quiz scores and progress exports."),
-        ("🔐","Role-based access","Separate workspaces for admin, tutor, parent and student.")
+        ("🎓","Student management","Admissions, guardian details, board, grade and enrolment status.","Admin Login"),
+        ("🗓️","Classes & attendance","Batch schedules, live-class links and attendance registers.","Student / Parent Login"),
+        ("💳","Fee tracking","Fee plans, invoices, payment records and outstanding balances.","Admin Login"),
+        ("📝","Assignments","Homework, due dates, instructions, scores and feedback.","Student / Parent Login"),
+        ("📊","Academic reports","Performance by subject, attendance and progress exports.","Admin Login"),
+        ("🔐","Role-based access","Separate workspaces for admin, tutor, parent and student.","Student / Parent Login")
     ]
-    for col,(icon,title,desc) in zip([cols[0],cols[1],cols[2],cols[0],cols[1],cols[2]],features):
-        with col:
-            st.markdown(f"### {icon} {title}\n{desc}")
-    st.info("This app uses Supabase for persistence. Configure database schema and authentication before inviting real families.")
+    for start in range(0, len(features), 3):
+        cols = st.columns(3)
+        for col, (icon, title, desc, target) in zip(cols, features[start:start+3]):
+            with col:
+                st.markdown(f'<div class="feature-card"><h3>{icon} {title}</h3><p>{desc}</p></div>', unsafe_allow_html=True)
+                if st.button("Explore →", key=f"explore_{title}", use_container_width=True):
+                    st.session_state["selected_portal"] = target
+                    st.rerun()
+    st.markdown('<div class="portal-hero"><h1>Ready to learn?</h1><p>Sign in to your own workspace. Your menus and records depend on your approved account role.</p></div>', unsafe_allow_html=True)
+    a,b = st.columns(2)
+    if a.button("🔐 Admin & Tutor Login", type="primary", use_container_width=True):
+        st.session_state["selected_portal"] = "Admin Login"
+        st.rerun()
+    if b.button("🎒 Student & Parent Portal", use_container_width=True):
+        st.session_state["selected_portal"] = "Student / Parent Login"
+        st.rerun()
+    st.caption("Security: student/parent-specific records and class links must be linked to verified accounts before real student data is enabled.")
 
-elif page == "Sign in / Register":
-    page_header("Account access","Use an email and password. New accounts need an approved role in the profiles table.")
-    mode = st.segmented_control("Choose action", ["Sign in","Register"], default="Sign in")
+elif page in ["Admin Login", "Student / Parent Login"]:
+    portal_is_admin = page == "Admin Login"
+    title = "Admin & Tutor Access" if portal_is_admin else "Student & Parent Portal"
+    st.markdown(f'<div class="portal-hero"><h1>{title}</h1><p>{"Manage enrolments, classes, attendance, fees and academic operations." if portal_is_admin else "Access your classes, meeting schedule, assignments and learning progress."}</p></div>', unsafe_allow_html=True)
+    st.write("")
+    page_header("Sign in or register", "Your permissions are determined by the role approved in your profile.")
+    mode = st.segmented_control("Choose action", ["Sign in","Register"] if not portal_is_admin else ["Sign in"], default="Sign in")
     with st.form("auth_form"):
         email = st.text_input("Email address")
         password = st.text_input("Password", type="password", help="Use a strong, unique password.")
@@ -194,7 +232,7 @@ elif page == "Sign in / Register":
         else:
             try:
                 if mode == "Register":
-                    auth_result = sb.auth.sign_up({"email": email.strip(), "password": password})
+                    auth_result = sb.auth.sign_up({"email": email.strip(), "password": password, "options": {"data": {"full_name": full_name.strip()}}})
                     user = getattr(auth_result, "user", None)
                     if user:
                         st.success("Registration submitted. Confirm your email if Supabase email confirmation is enabled.")
@@ -210,29 +248,62 @@ elif page == "Sign in / Register":
                         st.session_state.supabase_access_token = getattr(session, "access_token", None)
                         st.session_state.supabase_refresh_token = getattr(session, "refresh_token", None)
                     st.session_state.profile = get_profile(auth_result.user.id)
+                    signed_role = (st.session_state.profile or {}).get("role", "")
                     if not st.session_state.profile:
                         st.warning("Authentication succeeded, but no profile exists. Ask an administrator to create/approve your profile.")
-                    st.rerun()
+                    elif portal_is_admin and signed_role not in ["admin", "tutor"]:
+                        st.session_state.user = None
+                        st.session_state.profile = None
+                        st.session_state.supabase_access_token = None
+                        st.session_state.supabase_refresh_token = None
+                        st.error("This account is not approved for Admin/Tutor access. Use the Student & Parent Portal or contact the administrator.")
+                    elif not portal_is_admin and signed_role not in ["student", "parent"]:
+                        st.session_state.user = None
+                        st.session_state.profile = None
+                        st.session_state.supabase_access_token = None
+                        st.session_state.supabase_refresh_token = None
+                        st.error("This account is an Admin/Tutor account. Please use Admin & Tutor Login.")
+                    else:
+                        st.rerun()
             except Exception as e:
                 st.error("Authentication failed.")
                 st.caption(str(e))
     st.caption("Security note: role assignment is administrator-controlled. Public registration must never be allowed to self-assign the admin role.")
 
-elif page == "My Dashboard":
+elif page in ["Admin Overview", "Tutor Dashboard", "Student Portal", "Parent Portal", "Account Pending", "My Dashboard"]:
     if require_login():
         p = st.session_state.profile or {}
         st.subheader(f"Welcome, {p.get('full_name') or st.session_state.user.email}")
         st.write(f"**Role:** {p.get('role','pending')} · **Board:** {p.get('board') or 'Not set'} · **Grade:** {p.get('grade') or 'Not set'}")
         if role() in ["admin","tutor"]:
+            st.markdown('<div class="portal-hero"><h1>Operations at a glance</h1><p>Use the cards below to manage your tuition academy.</p></div>', unsafe_allow_html=True)
             students = safe_call(lambda: list_rows("students"), [])
             batches = safe_call(lambda: list_rows("batches"), [])
-            payments = safe_call(lambda: list_rows("payments"), [])
-            a,b,c = st.columns(3)
+            payments = safe_call(lambda: list_rows("payments"), []) if role() == "admin" else []
+            assignments = safe_call(lambda: list_rows("assignments"), [])
+            a,b,c,d = st.columns(4)
             a.metric("Student records",len(students))
-            b.metric("Batches",len(batches))
-            c.metric("Payment entries",len(payments))
+            b.metric("Active batches",sum(1 for x in batches if x.get("status", "active") == "active"))
+            c.metric("Assignments",len(assignments))
+            d.metric("Payment entries",len(payments) if role() == "admin" else "Admin only")
+            st.subheader("Quick actions")
+            actions = [("🎓 Students","Students"),("📚 Batches & Classes","Batches & Classes"),("🎥 Online Classes","Online Classes"),("📝 Assignments","Assignments")]
+            quick_cols = st.columns(4)
+            for col, (label, target) in zip(quick_cols, actions):
+                with col:
+                    if st.button(label, key=f"quick_{target}", use_container_width=True):
+                        st.session_state["quick_nav"] = target
+                        st.info(f"Use the {target} page in the sidebar to continue.")
+        elif role() in ["student", "parent"]:
+            st.markdown('<div class="portal-hero"><h1>Your learning space</h1><p>Classes, homework and progress — in one place.</p></div>', unsafe_allow_html=True)
+            st.info("Your account is signed in. To safely show personal schedules, meeting links, attendance, fees and assignments, the database must first link this login to the correct student record. That relationship is not configured yet, so private student records are intentionally not displayed.")
+            st.subheader("What will appear here")
+            c1,c2,c3 = st.columns(3)
+            c1.markdown('<div class="feature-card"><h3>🎥 Online classes</h3><p>Meeting link, date, time, teacher and class notes.</p></div>', unsafe_allow_html=True)
+            c2.markdown('<div class="feature-card"><h3>📝 Assignments</h3><p>Homework instructions, due dates and feedback.</p></div>', unsafe_allow_html=True)
+            c3.markdown('<div class="feature-card"><h3>📈 Progress</h3><p>Attendance and academic progress for your linked student.</p></div>', unsafe_allow_html=True)
         else:
-            st.info("Your dashboard will show classes, assignments, attendance and progress linked to your approved account.")
+            st.warning("Your account role is pending administrator approval.")
 
 elif page == "Students":
     if require_roles("admin","tutor"):
@@ -287,6 +358,55 @@ elif page == "Batches & Classes":
                 if res is not None: st.success("Batch created.")
         rows = safe_call(lambda: list_rows("batches"), [])
         st.dataframe(table_df(rows), use_container_width=True, hide_index=True)
+
+elif page == "Online Classes":
+    if require_roles("admin", "tutor"):
+        page_header("Online classes & meeting schedule", "Schedule lessons and store the meeting link, platform and teacher notes.")
+        st.info("This page needs the class_meetings table migration applied in Supabase before it can save meetings.")
+        batches = safe_call(lambda: list_rows("batches"), [])
+        try:
+            existing_meetings = safe_call(lambda: list_rows("class_meetings"), [])
+        except Exception:
+            existing_meetings = []
+        if batches:
+            bmap = {f"{b.get('name')} · Class {b.get('grade')} · {b.get('subject')} · {b.get('id')}": b for b in batches}
+            with st.form("meeting_form", clear_on_submit=True):
+                meeting_title = st.text_input("Meeting title *", placeholder="Class 7 Mathematics — Algebra")
+                batch_key = st.selectbox("Batch *", list(bmap))
+                col1, col2, col3 = st.columns(3)
+                meeting_date = col1.date_input("Date", date.today())
+                start_time = col2.time_input("Start time", time(17, 0))
+                end_time = col3.time_input("End time", time(18, 0))
+                col4, col5 = st.columns(2)
+                platform = col4.selectbox("Platform", ["Google Meet", "Zoom", "Microsoft Teams", "Other"])
+                meeting_url = col5.text_input("Meeting URL *", placeholder="https://...")
+                meeting_notes = st.text_area("Agenda / class notes")
+                meeting_status = st.selectbox("Status", ["scheduled", "completed", "cancelled"])
+                submitted = st.form_submit_button("Save meeting", type="primary")
+            if submitted:
+                if not meeting_title.strip() or not meeting_url.strip().startswith(("https://", "http://")):
+                    st.error("Enter a meeting title and a valid http(s) meeting URL.")
+                elif end_time <= start_time:
+                    st.error("End time must be later than start time.")
+                else:
+                    batch = bmap[batch_key]
+                    payload = {"title": meeting_title.strip(), "batch_id": batch["id"], "meeting_date": str(meeting_date),
+                               "start_time": str(start_time), "end_time": str(end_time), "platform": platform,
+                               "meeting_url": meeting_url.strip(), "notes": meeting_notes.strip() or None, "status": meeting_status}
+                    res = safe_call(lambda: add_row("class_meetings", payload))
+                    if res is not None: st.success("Meeting saved.")
+            st.subheader("Upcoming and recent meetings")
+            meetings = safe_call(lambda: list_rows("class_meetings"), [])
+            if meetings:
+                b_lookup = {str(b.get("id")): b for b in batches}
+                for m in sorted(meetings, key=lambda x: (x.get("meeting_date") or "", x.get("start_time") or ""), reverse=True):
+                    batch = b_lookup.get(str(m.get("batch_id")), {})
+                    st.markdown(f'<div class="feature-card"><h3>🎥 {m.get("title", "Class meeting")}</h3><p><b>{m.get("meeting_date", "Date pending")}</b> · {m.get("start_time", "")}–{m.get("end_time", "")} · {m.get("platform", "Online")}</p><p>{batch.get("name", "Batch")} · Class {batch.get("grade", "?")} · {batch.get("subject", "")}</p><p>{m.get("notes") or "No notes added."}</p></div>', unsafe_allow_html=True)
+                    st.link_button("Open meeting link", m.get("meeting_url", "https://example.com"), disabled=not bool(m.get("meeting_url")))
+            else:
+                st.caption("No meetings have been scheduled yet.")
+        else:
+            st.warning("Create a batch first, then schedule its online class meeting.")
 
 elif page == "Attendance":
     if require_roles("admin","tutor"):
@@ -391,8 +511,8 @@ elif page == "Academic Reports":
 
 elif page == "Admin Settings":
     if require_roles("admin"):
-        page_header("Admin settings","Approve roles and manage access.")
-        st.warning("Use Supabase's dashboard to assign the first admin role securely. Never let public users choose their own role.")
+        page_header("Admin settings","Control account roles and academy access.")
+        st.warning("Role changes are managed here. Passwords are never displayed to administrators; use account recovery/reset flows. Creating Auth accounts on behalf of students requires a secure server-side invite function.")
         st.markdown("""
         **Bootstrap the first administrator**
         1. Register your own account through Sign in / Register.
